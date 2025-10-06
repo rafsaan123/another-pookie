@@ -1,0 +1,27 @@
+{
+  "name": "pookie-backend-node",
+  "version": "1.0.0",
+  "description": "Node.js Express API server for multi-Supabase BTEB results with web API fallback",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "NODE_ENV=development nodemon index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "lru-cache": "^10.4.3",
+    "morgan": "^1.10.0",
+    "node-cache": "^5.1.2",
+    "undici": "^6.19.8",
+    "@supabase/supabase-js": "^2.46.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
+
+
