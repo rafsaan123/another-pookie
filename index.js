@@ -22,8 +22,10 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// Enable HTTP keep-alive for faster outbound requests
-setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
+// Enable HTTP keep-alive for faster outbound requests (skip in Vercel)
+if (process.env.VERCEL !== '1') {
+  setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
+}
 
 // Tunable timeouts (ms) - serverless-friendly defaults
 const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 2500);
@@ -211,9 +213,19 @@ app.get('/health', async (req, res) => {
         search_order: config.search_order
       });
     }
+    
+    console.log(`Testing connection to project: ${name}`);
+    console.log(`URL: ${config.projects[name].url}`);
+    
     const client = getClient(name);
     const { data, error } = await client.from('programs').select('*').limit(1);
-    if (error) throw error;
+    
+    if (error) {
+      console.error('Supabase error:', error);
+      throw new Error(`Supabase error: ${error.message}`);
+    }
+    
+    console.log('Supabase connection successful');
     return res.json({ 
       status: 'healthy', 
       supabase_connected: true, 
@@ -222,12 +234,15 @@ app.get('/health', async (req, res) => {
       search_order: config.search_order
     });
   } catch (e) {
+    console.error('Health check error:', e);
     return res.status(500).json({ 
       status: 'unhealthy', 
       supabase_connected: false, 
       error: String(e.message || e),
       available_projects: Object.keys(config.projects),
-      search_order: config.search_order
+      search_order: config.search_order,
+      node_version: process.version,
+      platform: process.platform
     });
   }
 });
