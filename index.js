@@ -285,35 +285,26 @@ app.post('/api/projects/:project/switch', (req, res) => {
   res.json({ message: `Switched to project: ${name}`, current_project: name });
 });
 
-// Search result: race Supabase projects vs web fallback
+// Search result: try Supabase projects first, then web fallback
 app.post('/api/search-result', async (req, res) => {
   const { rollNo, regulation, program } = req.body || {};
   if (!rollNo || !regulation || !program) return res.status(400).json({ error: 'Missing required fields: rollNo, regulation, program' });
 
   const order = config.search_order || Object.keys(config.projects);
   
-  // Race: Supabase projects vs Web fallback
-  const supabasePromise = Promise.any(
-    order.map(name => withTimeout(
-      queryStudentInProject(name, rollNo, regulation, program)
-        .then(r => (r ? { ...r, project_name: name } : Promise.reject(new Error('not_found')))),
-      PROJECT_TIMEOUT_MS
-    ))
-  ).catch(() => null);
-
-  const webFallbackPromise = withTimeout(
-    webApiFallback(rollNo, regulation, program),
-    WEB_TIMEOUT_MS
-  ).catch(() => null);
-
-  // Race both approaches
-  const [supabaseResult, webResult] = await Promise.allSettled([
-    supabasePromise,
-    webFallbackPromise
-  ]);
-
-  const winner = supabaseResult.status === 'fulfilled' ? supabaseResult.value : null;
-  const fallback = webResult.status === 'fulfilled' ? webResult.value : null;
+  // Try Supabase projects first (parallel search, first success wins)
+  let winner = null;
+  try {
+    winner = await Promise.any(
+      order.map(name => withTimeout(
+        queryStudentInProject(name, rollNo, regulation, program)
+          .then(r => (r ? { ...r, project_name: name } : Promise.reject(new Error('not_found')))),
+        PROJECT_TIMEOUT_MS
+      ))
+    );
+  } catch (_) {
+    winner = null;
+  }
 
   if (winner) {
     // Winner from Supabase: fetch GPA and CGPA in parallel
@@ -347,7 +338,8 @@ app.post('/api/search-result', async (req, res) => {
     return res.json(transformed);
   }
 
-  // If not found in Supabase, use web fallback result
+  // If not found in any Supabase project, try web fallback
+  const fallback = await webApiFallback(rollNo, regulation, program);
   if (fallback) {
     const transformedWeb = {
       success: true,
