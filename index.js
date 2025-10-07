@@ -41,28 +41,26 @@ function withTimeout(promise, ms) {
 // Fetch student + institute + GPA + CGPA from Supabase
 async function fetchFromSupabase(roll, regulation, program) {
   try {
-    // Single query with JOIN (short timeout)
+    // Fetch student first (short timeout) without joining institutes
     const { data: student, error: studentErr } = await withTimeout(
       supabase
         .from('students')
-        .select(`
-          roll_number,
-          program_name,
-          regulation_year,
-          institute_code,
-          created_at,
-          institutes!inner(institute_code, name, district)
-        `)
+        .select('roll_number, program_name, regulation_year, institute_code, created_at')
         .eq('program_name', program)
         .eq('regulation_year', regulation)
         .eq('roll_number', roll)
-        .eq('institutes.program_name', program)
-        .eq('institutes.regulation_year', regulation)
         .maybeSingle(),
       STUDENT_TIMEOUT
     );
 
     if (studentErr || !student) return null;
+
+    // Fetch institute by institute_code (do not over-constrain)
+    const { data: institute } = await supabase
+      .from('institutes')
+      .select('institute_code, name, district')
+      .eq('institute_code', student.institute_code)
+      .maybeSingle();
 
     // Fetch GPA and CGPA in parallel (independent timeouts)
     const [gpaRes, cgpaRes] = await Promise.allSettled([
@@ -94,9 +92,9 @@ async function fetchFromSupabase(roll, regulation, program) {
       regulation: student.regulation_year,
       exam: student.program_name,
       instituteData: {
-        code: student.institutes?.institute_code || student.institute_code,
-        name: student.institutes?.name || 'Unknown',
-        district: student.institutes?.district || 'Unknown'
+        code: institute?.institute_code || student.institute_code,
+        name: institute?.name || 'Unknown',
+        district: institute?.district || 'Unknown'
       },
       resultData: gpaRecords.map(g => ({
         publishedAt: g.created_at || '2025-01-01T00:00:00Z',
@@ -177,6 +175,25 @@ app.get('/health', async (req, res) => {
       supabase_connected: false,
       error: String(e.message || e)
     });
+  }
+});
+
+// TEMP: lightweight debug endpoint (remove after verification)
+app.get('/__debug__/roll/:roll', async (req, res) => {
+  const roll = req.params.roll;
+  try {
+    const [s, g, c] = await Promise.allSettled([
+      supabase.from('students').select('roll_number').eq('roll_number', roll).maybeSingle(),
+      supabase.from('gpa_records').select('roll_number', { count: 'exact', head: true }).eq('roll_number', roll),
+      supabase.from('cgpa_records').select('roll_number', { count: 'exact', head: true }).eq('roll_number', roll)
+    ]);
+    res.json({
+      student: s.status === 'fulfilled' && s.value?.data ? true : false,
+      gpaCount: g.status === 'fulfilled' ? (g.value?.count ?? null) : null,
+      cgpaCount: c.status === 'fulfilled' ? (c.value?.count ?? null) : null
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
