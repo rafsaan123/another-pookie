@@ -4,6 +4,7 @@
   "description": "Node.js Express API server for multi-Supabase BTEB results with web API fallback",
   "main": "index.js",
   "type": "module",
+  "engines": { "node": ">=20" },
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development nodemon index.js"
