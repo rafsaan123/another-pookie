@@ -5,15 +5,8 @@ import morgan from 'morgan';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import fs from 'fs';
-import { setGlobalDispatcher, Agent } from 'undici';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -22,17 +15,19 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// Enable HTTP keep-alive for faster outbound requests (skip in Vercel)
-if (process.env.VERCEL !== '1') {
-  setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
-}
+// Configuration
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.SUPABASE_PRIMARY_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_PRIMARY_KEY;
+const WEB_API_BASE = 'https://btebresulthub-server.vercel.app';
 
-// Tunable timeouts (ms) - ultra-fast defaults
-const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 1000);
-const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 600);
-const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 400);
-const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 1500);
+// Timeouts (ms)
+const DB_TIMEOUT = Number(process.env.DB_TIMEOUT || 2000);
+const WEB_TIMEOUT = Number(process.env.WEB_TIMEOUT || 3000);
 
+// Create Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Utility: timeout wrapper
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
@@ -40,331 +35,187 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-// Load multi-supabase config (reuse Python json if present)
-const CONFIG_PATH = path.resolve(__dirname, 'supabase_projects.json');
-function loadConfig() {
+// Fetch student + institute from Supabase
+async function fetchFromSupabase(roll, regulation, program) {
   try {
-    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
-    const json = JSON.parse(raw);
-    return json;
-  } catch (e) {
-    return { current_project: null, search_order: [], projects: {}, settings: {} };
-  }
-}
-
-let config = loadConfig();
-
-// Environment overrides
-function applyEnvToConfig(cfg) {
-  const out = { ...cfg, projects: { ...cfg.projects } };
-  const envPrimaryUrl = process.env.SUPABASE_URL || process.env.SUPABASE_PRIMARY_URL;
-  const envPrimaryKey = process.env.SUPABASE_KEY || process.env.SUPABASE_PRIMARY_KEY;
-  if (envPrimaryUrl && envPrimaryKey) {
-    out.projects.primary = {
-      url: envPrimaryUrl,
-      key: envPrimaryKey,
-      description: (out.projects.primary && out.projects.primary.description) || 'Primary Supabase project'
-    };
-    if (!out.current_project) out.current_project = 'primary';
-    if (!out.search_order || out.search_order.length === 0) out.search_order = ['primary'];
-  }
-  // Secondary (optional)
-  const envSecondaryUrl = process.env.SUPABASE_SECONDARY_URL;
-  const envSecondaryKey = process.env.SUPABASE_SECONDARY_KEY;
-  if (envSecondaryUrl && envSecondaryKey) {
-    out.projects.secondary = {
-      url: envSecondaryUrl,
-      key: envSecondaryKey,
-      description: (out.projects.secondary && out.projects.secondary.description) || 'Secondary Supabase project'
-    };
-    if (!out.search_order.includes('secondary')) out.search_order.push('secondary');
-  }
-  return out;
-}
-
-config = applyEnvToConfig(config);
-
-// Create lazy clients map
-const clients = new Map();
-function getClient(name) {
-  const project = config.projects[name];
-  if (!project) throw new Error(`Project ${name} not found`);
-  if (!clients.has(name)) {
-    clients.set(name, createClient(project.url, project.key));
-  }
-  return clients.get(name);
-}
-
-// No caching per requirement
-
-async function queryStudentInProject(projectName, roll, regulation, program) {
-  const client = getClient(projectName);
-  
-  // Single query with JOIN to get student + institute data
-  const { data, error } = await client
-    .from('students')
-    .select(`
-      roll_number, 
-      program_name, 
-      regulation_year, 
-      institute_code, 
-      created_at,
-      institutes!inner(institute_code, name, district)
-    `)
-    .eq('program_name', program)
-    .eq('regulation_year', regulation)
-    .eq('roll_number', roll)
-    .eq('institutes.program_name', program)
-    .eq('institutes.regulation_year', regulation)
-    .maybeSingle();
-
-  if (error) throw new Error(error.message);
-  if (!data) return null;
-
-  return { 
-    student: {
-      roll_number: data.roll_number,
-      program_name: data.program_name,
-      regulation_year: data.regulation_year,
-      institute_code: data.institute_code,
-      created_at: data.created_at
-    }, 
-    institute: data.institutes 
-  };
-}
-
-async function fetchGpaRecords(projectName, roll) {
-  const client = getClient(projectName);
-  const { data, error } = await client
-    .from('gpa_records')
-    .select('semester, gpa, is_reference, ref_subjects, created_at')
-    .eq('roll_number', roll);
-  if (error) throw new Error(error.message);
-  return data || [];
-}
-
-async function fetchCgpaRecordsAcrossProjects(roll) {
-  const names = config.search_order || Object.keys(config.projects);
-  const queries = names.map(name => withTimeout((async () => {
-    const client = getClient(name);
-    const { data, error } = await client
-      .from('cgpa_records')
-      .select('semester, cgpa, created_at')
+    // Single query with JOIN
+    const { data: student, error: studentErr } = await supabase
+      .from('students')
+      .select(`
+        roll_number,
+        program_name,
+        regulation_year,
+        institute_code,
+        created_at,
+        institutes!inner(institute_code, name, district)
+      `)
+      .eq('program_name', program)
+      .eq('regulation_year', regulation)
       .eq('roll_number', roll)
-      .limit(20);
-    
-    if (error) throw error;
-    if (data && data.length) {
-      return data.map(r => ({
-        semester: r.semester || 'Final',
-        cgpa: String(r.cgpa ?? '0.00'),
-        publishedAt: r.created_at || '2025-01-01T00:00:00Z'
-      }));
-    }
-    throw new Error('empty');
-  })(), CGPA_TIMEOUT_MS));
+      .eq('institutes.program_name', program)
+      .eq('institutes.regulation_year', regulation)
+      .maybeSingle();
 
-  try {
-    return await Promise.any(queries);
-  } catch (_) {
-    return [];
-  }
-}
+    if (studentErr || !student) return null;
 
-// Web API fallback (disabled for sub-second latency target)
-async function webApiFallback(roll, regulation, program) {
-  const baseUrl = 'https://btebresulthub-server.vercel.app';
-  const url = `${baseUrl}/results/individual/${encodeURIComponent(roll)}`;
-  const params = { exam: program, regulation };
-  try {
-    const resp = await axios.get(url, { params, timeout: WEB_TIMEOUT_MS, headers: { 'User-Agent': 'BTEB-Results-App/1.0' } });
-    if (resp.status !== 200) return null;
-    const data = resp.data;
-    // Convert to internal format similar to Python
-    const gpaRecords = (data.resultData || []).map(r => ({
-      semester: Number(r.semester || 1),
-      gpa: typeof r.result === 'number' ? r.result : (r.result === 'ref' ? null : Number(r.result)),
-      is_reference: r.result === 'ref' || r.passed === false,
-      ref_subjects: Array.isArray(r.result?.ref_subjects) ? r.result.ref_subjects : [],
-      created_at: r.publishedAt || '2025-01-01T00:00:00Z'
-    }));
+    // Fetch GPA and CGPA in parallel
+    const [gpaRes, cgpaRes] = await Promise.allSettled([
+      supabase
+        .from('gpa_records')
+        .select('semester, gpa, is_reference, ref_subjects, created_at')
+        .eq('roll_number', roll)
+        .order('semester', { ascending: true }),
+      supabase
+        .from('cgpa_records')
+        .select('semester, cgpa, created_at')
+        .eq('roll_number', roll)
+        .order('semester', { ascending: true })
+        .limit(20)
+    ]);
+
+    const gpaRecords = gpaRes.status === 'fulfilled' && !gpaRes.value.error ? gpaRes.value.data : [];
+    const cgpaRecords = cgpaRes.status === 'fulfilled' && !cgpaRes.value.error ? cgpaRes.value.data : [];
+
     return {
-      source: 'web_api_btebresulthub',
-      student: {
-        roll_number: data.roll || roll,
-        program_name: data.exam || program,
-        regulation_year: data.regulation || regulation,
-        institute_code: data.instituteData?.code || '00000',
-        created_at: data.time || '2025-01-01T00:00:00Z'
+      success: true,
+      roll: student.roll_number,
+      regulation: student.regulation_year,
+      exam: student.program_name,
+      instituteData: {
+        code: student.institutes?.institute_code || student.institute_code,
+        name: student.institutes?.name || 'Unknown',
+        district: student.institutes?.district || 'Unknown'
       },
-      institute: {
-        name: data.instituteData?.name || 'Unknown',
-        district: data.instituteData?.district || 'Unknown',
-        institute_code: data.instituteData?.code || '00000'
-      },
-      gpaRecords
+      resultData: gpaRecords.map(g => ({
+        publishedAt: g.created_at || '2025-01-01T00:00:00Z',
+        semester: String(g.semester || 1),
+        passed: !g.is_reference,
+        gpa: g.gpa == null ? 'ref' : String(g.gpa),
+        result: {
+          gpa: g.gpa == null ? 'ref' : String(g.gpa),
+          ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : []
+        }
+      })),
+      cgpaData: cgpaRecords.map(c => ({
+        semester: c.semester || 'Final',
+        cgpa: String(c.cgpa ?? '0.00'),
+        publishedAt: c.created_at || '2025-01-01T00:00:00Z'
+      }))
     };
-  } catch (_) {
+  } catch (err) {
     return null;
   }
 }
 
-// Health
-app.get('/health', async (req, res) => {
+// Fetch from Web API fallback
+async function fetchFromWebAPI(roll, regulation, program) {
   try {
-    const name = config.current_project || config.search_order[0];
-    if (!name || !config.projects[name]) {
-      return res.status(500).json({ 
-        status: 'unhealthy', 
-        supabase_connected: false, 
-        error: 'No valid Supabase project configured',
-        available_projects: Object.keys(config.projects),
-        search_order: config.search_order
-      });
-    }
-    
-    const client = getClient(name);
-    const { data, error } = await client.from('programs').select('*').limit(1);
-    
-    if (error) throw new Error(`Supabase error: ${error.message}`);
-    
-    return res.json({ 
-      status: 'healthy', 
-      supabase_connected: true, 
-      current_project: name, 
-      available_projects: Object.keys(config.projects),
-      search_order: config.search_order
+    const url = `${WEB_API_BASE}/results/individual/${encodeURIComponent(roll)}`;
+    const resp = await axios.get(url, {
+      params: { exam: program, regulation },
+      timeout: WEB_TIMEOUT,
+      headers: { 'User-Agent': 'BTEB-Results-App/1.0' }
     });
-  } catch (e) {
-    return res.status(500).json({ 
-      status: 'unhealthy', 
-      supabase_connected: false, 
-      error: String(e.message || e),
-      available_projects: Object.keys(config.projects),
-      search_order: config.search_order
-    });
-  }
-});
 
-// Projects list
-app.get('/api/projects', (req, res) => {
-  const info = {};
-  for (const [name, project] of Object.entries(config.projects)) {
-    info[name] = { name, description: project.description, url: project.url, is_active: name === config.current_project };
-  }
-  res.json(info);
-});
+    if (resp.status !== 200 || !resp.data) return null;
 
-// Switch project
-app.post('/api/projects/:project/switch', (req, res) => {
-  const name = req.params.project;
-  if (!config.projects[name]) return res.status(404).json({ error: `Project ${name} not found` });
-  config.current_project = name;
-  res.json({ message: `Switched to project: ${name}`, current_project: name });
-});
-
-// Search result: try Supabase projects first, then web fallback
-app.post('/api/search-result', async (req, res) => {
-  const { rollNo, regulation, program } = req.body || {};
-  if (!rollNo || !regulation || !program) return res.status(400).json({ error: 'Missing required fields: rollNo, regulation, program' });
-
-  const order = config.search_order || Object.keys(config.projects);
-  
-  // Try Supabase projects first (parallel search, first success wins)
-  let winner = null;
-  try {
-    winner = await Promise.any(
-      order.map(name => withTimeout(
-        queryStudentInProject(name, rollNo, regulation, program)
-          .then(r => (r ? { ...r, project_name: name } : Promise.reject(new Error('not_found')))),
-        PROJECT_TIMEOUT_MS
-      ))
-    );
-  } catch (_) {
-    winner = null;
-  }
-
-  if (winner) {
-    // Winner from Supabase: fetch GPA and CGPA in parallel
-    const [gpas, cgpas] = await Promise.allSettled([
-      withTimeout(fetchGpaRecords(winner.project_name, rollNo), GPA_TIMEOUT_MS),
-      withTimeout(fetchCgpaRecordsAcrossProjects(rollNo), CGPA_TIMEOUT_MS)
-    ]).then(results => [
-      results[0].status === 'fulfilled' ? results[0].value : [],
-      results[1].status === 'fulfilled' ? results[1].value : []
-    ]);
-
-    const transformed = {
+    const data = resp.data;
+    return {
       success: true,
-      roll: winner.student.roll_number,
-      regulation: winner.student.regulation_year,
-      exam: winner.student.program_name,
-      instituteData: {
-        code: winner.institute?.institute_code || '00000',
-        name: winner.institute?.name || 'Unknown',
-        district: winner.institute?.district || 'Unknown'
-      },
-      resultData: gpas.map(g => ({
-        publishedAt: g.created_at || '2025-01-01T00:00:00Z',
-        semester: String(g.semester || 1),
-        result: { gpa: g.gpa == null ? 'ref' : (Number.isInteger(g.gpa) ? `${g.gpa}.0` : String(g.gpa)), ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : [] },
-        passed: g.is_reference ? false : true,
-        gpa: g.gpa == null ? 'ref' : (Number.isInteger(g.gpa) ? `${g.gpa}.0` : String(g.gpa))
-      })),
-      cgpaData: cgpas
-    };
-    return res.json(transformed);
-  }
-
-  // If not found in any Supabase project, try web fallback
-  const fallback = await webApiFallback(rollNo, regulation, program);
-  if (fallback) {
-    const transformedWeb = {
-      success: true,
-      time: fallback.student.created_at || '2025-01-01T00:00:00Z',
-      roll: fallback.student.roll_number,
-      regulation: fallback.student.regulation_year,
-      exam: fallback.student.program_name,
-      found_in_project: fallback.source || 'web_api',
-      projects_searched: (config.search_order || Object.keys(config.projects)).concat(['web_apis']),
+      time: data.time || new Date().toISOString(),
+      roll: data.roll || roll,
+      regulation: data.regulation || regulation,
+      exam: data.exam || program,
       source: 'web_api',
       instituteData: {
-        code: fallback.institute?.institute_code || '00000',
-        name: fallback.institute?.name || 'Unknown',
-        district: fallback.institute?.district || 'Unknown'
+        code: data.instituteData?.code || '00000',
+        name: data.instituteData?.name || 'Unknown',
+        district: data.instituteData?.district || 'Unknown'
       },
-      resultData: (fallback.gpaRecords || []).map(g => ({
-        publishedAt: g.created_at || '2025-01-01T00:00:00Z',
-        semester: String(g.semester || 1),
-        passed: g.is_reference ? false : true,
-        gpa: g.gpa == null ? 'ref' : String(g.gpa),
-        result: { gpa: g.gpa == null ? 'ref' : String(g.gpa), ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : [] }
+      resultData: (data.resultData || []).map(r => ({
+        publishedAt: r.publishedAt || '2025-01-01T00:00:00Z',
+        semester: String(r.semester || 1),
+        passed: r.passed !== false,
+        gpa: typeof r.result === 'object' ? (r.result.gpa || 'ref') : String(r.result || 'ref'),
+        result: {
+          gpa: typeof r.result === 'object' ? (r.result.gpa || 'ref') : String(r.result || 'ref'),
+          ref_subjects: typeof r.result === 'object' && Array.isArray(r.result.ref_subjects) ? r.result.ref_subjects : []
+        }
       })),
-      cgpaData: []
+      cgpaData: data.cgpaData || []
     };
-    return res.json(transformedWeb);
+  } catch (err) {
+    return null;
+  }
+}
+
+// Health check
+app.get('/health', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('programs').select('*').limit(1);
+    if (error) throw error;
+    res.json({
+      status: 'healthy',
+      supabase_connected: true,
+      supabase_url: SUPABASE_URL
+    });
+  } catch (e) {
+    res.status(500).json({
+      status: 'unhealthy',
+      supabase_connected: false,
+      error: String(e.message || e)
+    });
+  }
+});
+
+// Search result endpoint
+app.post('/api/search-result', async (req, res) => {
+  const { rollNo, regulation, program } = req.body || {};
+  
+  if (!rollNo || !regulation || !program) {
+    return res.status(400).json({
+      error: 'Missing required fields: rollNo, regulation, program'
+    });
   }
 
+  // Try Supabase first
+  let result = await withTimeout(
+    fetchFromSupabase(rollNo, regulation, program),
+    DB_TIMEOUT
+  ).catch(() => null);
+
+  if (result) {
+    return res.json(result);
+  }
+
+  // Fallback to Web API
+  result = await withTimeout(
+    fetchFromWebAPI(rollNo, regulation, program),
+    WEB_TIMEOUT
+  ).catch(() => null);
+
+  if (result) {
+    return res.json(result);
+  }
+
+  // Not found
   return res.status(404).json({
     success: false,
-    error: 'Student not found in any database or web API',
+    error: 'Student not found in database or web API',
     roll: rollNo,
     regulation,
-    exam: program,
-    projects_searched: config.search_order || Object.keys(config.projects),
-    web_apis_tried: ['btebresulthub']
+    exam: program
   });
 });
 
-// Regulations (simple)
+// Regulations endpoint
 app.get('/api/regulations/:program', async (req, res) => {
   try {
-    const name = config.current_project || config.search_order[0];
-    const client = getClient(name);
-    const { data, error } = await client
+    const { data, error } = await supabase
       .from('regulations')
       .select('regulation_year')
       .eq('program_name', req.params.program);
+    
     if (error) throw error;
     res.json({ regulations: (data || []).map(r => r.regulation_year) });
   } catch (e) {
@@ -376,5 +227,3 @@ const port = Number(process.env.PORT || 4000);
 app.listen(port, () => {
   console.log(`Node API listening on :${port}`);
 });
-
-
