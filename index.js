@@ -137,27 +137,38 @@ async function fetchGpaRecords(projectName, roll) {
 
 async function fetchCgpaRecordsAcrossProjects(roll) {
   const names = config.search_order || Object.keys(config.projects);
+  console.log(`Fetching CGPA for roll ${roll} across projects:`, names);
+  
   const queries = names.map(name => withTimeout((async () => {
+    console.log(`Trying CGPA fetch from project: ${name}`);
     const client = getClient(name);
     const { data, error } = await client
       .from('cgpa_records')
       .select('semester, cgpa, created_at')
       .eq('roll_number', roll)
       .limit(20);
+    
+    console.log(`CGPA query result for ${name}:`, { data, error });
+    
     if (error) throw error;
     if (data && data.length) {
-      return data.map(r => ({
+      const result = data.map(r => ({
         semester: r.semester || 'Final',
         cgpa: String(r.cgpa ?? '0.00'),
         publishedAt: r.created_at || '2025-01-01T00:00:00Z'
       }));
+      console.log(`CGPA data found in ${name}:`, result);
+      return result;
     }
     throw new Error('empty');
   })(), CGPA_TIMEOUT_MS));
 
   try {
-    return await Promise.any(queries);
-  } catch (_) {
+    const result = await Promise.any(queries);
+    console.log('CGPA fetch successful:', result);
+    return result;
+  } catch (e) {
+    console.log('CGPA fetch failed:', e.message);
     return [];
   }
 }
@@ -304,9 +315,9 @@ app.post('/api/search-result', async (req, res) => {
       resultData: gpas.map(g => ({
         publishedAt: g.created_at || '2025-01-01T00:00:00Z',
         semester: String(g.semester || 1),
-        result: { gpa: g.gpa == null ? 'ref' : String(g.gpa), ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : [] },
+        result: { gpa: g.gpa == null ? 'ref' : (Number.isInteger(g.gpa) ? `${g.gpa}.0` : String(g.gpa)), ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : [] },
         passed: g.is_reference ? false : true,
-        gpa: g.gpa == null ? 'ref' : String(g.gpa)
+        gpa: g.gpa == null ? 'ref' : (Number.isInteger(g.gpa) ? `${g.gpa}.0` : String(g.gpa))
       })),
       cgpaData: cgpas
     };
