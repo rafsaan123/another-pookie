@@ -27,11 +27,11 @@ if (process.env.VERCEL !== '1') {
   setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
 }
 
-// Tunable timeouts (ms) - optimized for speed
-const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 1500);
-const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 800);
-const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 600);
-const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 2000);
+// Tunable timeouts (ms) - ultra-fast defaults
+const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 1000);
+const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 600);
+const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 400);
+const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 1500);
 
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -48,7 +48,6 @@ function loadConfig() {
     const json = JSON.parse(raw);
     return json;
   } catch (e) {
-    console.log('Config file not found, using env vars only');
     return { current_project: null, search_order: [], projects: {}, settings: {} };
   }
 }
@@ -139,18 +138,14 @@ async function fetchGpaRecords(projectName, roll) {
   const { data, error } = await client
     .from('gpa_records')
     .select('semester, gpa, is_reference, ref_subjects, created_at')
-    .eq('roll_number', roll)
-    .order('semester', { ascending: true });
+    .eq('roll_number', roll);
   if (error) throw new Error(error.message);
   return data || [];
 }
 
 async function fetchCgpaRecordsAcrossProjects(roll) {
   const names = config.search_order || Object.keys(config.projects);
-  console.log(`Fetching CGPA for roll ${roll} across projects:`, names);
-  
   const queries = names.map(name => withTimeout((async () => {
-    console.log(`Trying CGPA fetch from project: ${name}`);
     const client = getClient(name);
     const { data, error } = await client
       .from('cgpa_records')
@@ -158,27 +153,20 @@ async function fetchCgpaRecordsAcrossProjects(roll) {
       .eq('roll_number', roll)
       .limit(20);
     
-    console.log(`CGPA query result for ${name}:`, { data, error });
-    
     if (error) throw error;
     if (data && data.length) {
-      const result = data.map(r => ({
+      return data.map(r => ({
         semester: r.semester || 'Final',
         cgpa: String(r.cgpa ?? '0.00'),
         publishedAt: r.created_at || '2025-01-01T00:00:00Z'
       }));
-      console.log(`CGPA data found in ${name}:`, result);
-      return result;
     }
     throw new Error('empty');
   })(), CGPA_TIMEOUT_MS));
 
   try {
-    const result = await Promise.any(queries);
-    console.log('CGPA fetch successful:', result);
-    return result;
-  } catch (e) {
-    console.log('CGPA fetch failed:', e.message);
+    return await Promise.any(queries);
+  } catch (_) {
     return [];
   }
 }
@@ -235,18 +223,11 @@ app.get('/health', async (req, res) => {
       });
     }
     
-    console.log(`Testing connection to project: ${name}`);
-    console.log(`URL: ${config.projects[name].url}`);
-    
     const client = getClient(name);
     const { data, error } = await client.from('programs').select('*').limit(1);
     
-    if (error) {
-      console.error('Supabase error:', error);
-      throw new Error(`Supabase error: ${error.message}`);
-    }
+    if (error) throw new Error(`Supabase error: ${error.message}`);
     
-    console.log('Supabase connection successful');
     return res.json({ 
       status: 'healthy', 
       supabase_connected: true, 
@@ -255,15 +236,12 @@ app.get('/health', async (req, res) => {
       search_order: config.search_order
     });
   } catch (e) {
-    console.error('Health check error:', e);
     return res.status(500).json({ 
       status: 'unhealthy', 
       supabase_connected: false, 
       error: String(e.message || e),
       available_projects: Object.keys(config.projects),
-      search_order: config.search_order,
-      node_version: process.version,
-      platform: process.platform
+      search_order: config.search_order
     });
   }
 });
