@@ -27,11 +27,11 @@ if (process.env.VERCEL !== '1') {
   setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
 }
 
-// Tunable timeouts (ms) - serverless-friendly defaults
-const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 2500);
-const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 1200);
-const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 800);
-const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 2500);
+// Tunable timeouts (ms) - optimized for speed
+const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 1500);
+const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 800);
+const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 600);
+const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 2000);
 
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -100,28 +100,38 @@ function getClient(name) {
 
 async function queryStudentInProject(projectName, roll, regulation, program) {
   const client = getClient(projectName);
-  const { data: student, error: studentErr } = await client
+  
+  // Single query with JOIN to get student + institute data
+  const { data, error } = await client
     .from('students')
-    .select('roll_number, program_name, regulation_year, institute_code, created_at')
+    .select(`
+      roll_number, 
+      program_name, 
+      regulation_year, 
+      institute_code, 
+      created_at,
+      institutes!inner(institute_code, name, district)
+    `)
     .eq('program_name', program)
     .eq('regulation_year', regulation)
     .eq('roll_number', roll)
+    .eq('institutes.program_name', program)
+    .eq('institutes.regulation_year', regulation)
     .maybeSingle();
 
-  if (studentErr) throw new Error(studentErr.message);
-  if (!student) return null;
+  if (error) throw new Error(error.message);
+  if (!data) return null;
 
-  const { data: institutes } = await client
-    .from('institutes')
-    .select('institute_code, name, district')
-    .eq('program_name', program)
-    .eq('regulation_year', regulation)
-    .eq('institute_code', student.institute_code)
-    .limit(1);
-
-  const institute = institutes && institutes[0] ? institutes[0] : null;
-
-  return { student, institute };
+  return { 
+    student: {
+      roll_number: data.roll_number,
+      program_name: data.program_name,
+      regulation_year: data.regulation_year,
+      institute_code: data.institute_code,
+      created_at: data.created_at
+    }, 
+    institute: data.institutes 
+  };
 }
 
 async function fetchGpaRecords(projectName, roll) {
@@ -275,31 +285,44 @@ app.post('/api/projects/:project/switch', (req, res) => {
   res.json({ message: `Switched to project: ${name}`, current_project: name });
 });
 
-// Search result: try Supabase projects first (first-success), then web fallback
+// Search result: race Supabase projects vs web fallback
 app.post('/api/search-result', async (req, res) => {
   const { rollNo, regulation, program } = req.body || {};
   if (!rollNo || !regulation || !program) return res.status(400).json({ error: 'Missing required fields: rollNo, regulation, program' });
 
   const order = config.search_order || Object.keys(config.projects);
-  // Query all Supabase projects in parallel; resolve on first success (with per-project timeout)
-  const projectPromises = order.map(name => withTimeout(
-    queryStudentInProject(name, rollNo, regulation, program)
-      .then(r => (r ? { ...r, project_name: name } : Promise.reject(new Error('not_found')))),
-    PROJECT_TIMEOUT_MS
-  ));
+  
+  // Race: Supabase projects vs Web fallback
+  const supabasePromise = Promise.any(
+    order.map(name => withTimeout(
+      queryStudentInProject(name, rollNo, regulation, program)
+        .then(r => (r ? { ...r, project_name: name } : Promise.reject(new Error('not_found')))),
+      PROJECT_TIMEOUT_MS
+    ))
+  ).catch(() => null);
 
-  let winner = null;
-  try {
-    winner = await Promise.any(projectPromises);
-  } catch (_) {
-    winner = null;
-  }
+  const webFallbackPromise = withTimeout(
+    webApiFallback(rollNo, regulation, program),
+    WEB_TIMEOUT_MS
+  ).catch(() => null);
+
+  // Race both approaches
+  const [supabaseResult, webResult] = await Promise.allSettled([
+    supabasePromise,
+    webFallbackPromise
+  ]);
+
+  const winner = supabaseResult.status === 'fulfilled' ? supabaseResult.value : null;
+  const fallback = webResult.status === 'fulfilled' ? webResult.value : null;
 
   if (winner) {
-    // Winner from Supabase: fetch GPA and CGPA (like Python)
-    const [gpas, cgpas] = await Promise.all([
-      withTimeout(fetchGpaRecords(winner.project_name, rollNo), GPA_TIMEOUT_MS).catch(() => []),
-      withTimeout(fetchCgpaRecordsAcrossProjects(rollNo), CGPA_TIMEOUT_MS).catch(() => [])
+    // Winner from Supabase: fetch GPA and CGPA in parallel
+    const [gpas, cgpas] = await Promise.allSettled([
+      withTimeout(fetchGpaRecords(winner.project_name, rollNo), GPA_TIMEOUT_MS),
+      withTimeout(fetchCgpaRecordsAcrossProjects(rollNo), CGPA_TIMEOUT_MS)
+    ]).then(results => [
+      results[0].status === 'fulfilled' ? results[0].value : [],
+      results[1].status === 'fulfilled' ? results[1].value : []
     ]);
 
     const transformed = {
@@ -324,8 +347,7 @@ app.post('/api/search-result', async (req, res) => {
     return res.json(transformed);
   }
 
-  // If not found in any Supabase project, try web fallback
-  const fallback = await webApiFallback(rollNo, regulation, program);
+  // If not found in Supabase, use web fallback result
   if (fallback) {
     const transformedWeb = {
       success: true,
