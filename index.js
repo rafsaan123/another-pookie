@@ -75,10 +75,8 @@ async function fetchFromSupabase(roll, regulation, program) {
       withTimeout(
         supabase
           .from('cgpa_records')
-          .select('semester, cgpa, created_at')
-          .eq('roll_number', roll)
-          .order('semester', { ascending: true })
-          .limit(20),
+          .select('*')
+          .eq('roll_number', roll),
         CGPA_TIMEOUT
       )
     ]);
