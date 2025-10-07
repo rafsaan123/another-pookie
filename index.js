@@ -25,11 +25,11 @@ if (process.env.NODE_ENV !== 'production') {
 // Enable HTTP keep-alive for faster outbound requests
 setGlobalDispatcher(new Agent({ keepAlive: true, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000, connections: 128 }));
 
-// Tunable timeouts (ms)
-const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 500);
-const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 300);
-const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 200);
-const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 600);
+// Tunable timeouts (ms) - serverless-friendly defaults
+const PROJECT_TIMEOUT_MS = Number(process.env.PROJECT_TIMEOUT_MS || 2500);
+const GPA_TIMEOUT_MS = Number(process.env.GPA_TIMEOUT_MS || 1200);
+const CGPA_TIMEOUT_MS = Number(process.env.CGPA_TIMEOUT_MS || 800);
+const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 2500);
 
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -39,13 +39,14 @@ function withTimeout(promise, ms) {
 }
 
 // Load multi-supabase config (reuse Python json if present)
-const CONFIG_PATH = path.resolve(__dirname, '..', 'supabase_projects.json');
+const CONFIG_PATH = path.resolve(__dirname, 'supabase_projects.json');
 function loadConfig() {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
     const json = JSON.parse(raw);
     return json;
   } catch (e) {
+    console.log('Config file not found, using env vars only');
     return { current_project: null, search_order: [], projects: {}, settings: {} };
   }
 }
@@ -201,13 +202,33 @@ async function webApiFallback(roll, regulation, program) {
 app.get('/health', async (req, res) => {
   try {
     const name = config.current_project || config.search_order[0];
-    if (!name) return res.status(500).json({ status: 'unhealthy', supabase_connected: false });
+    if (!name || !config.projects[name]) {
+      return res.status(500).json({ 
+        status: 'unhealthy', 
+        supabase_connected: false, 
+        error: 'No valid Supabase project configured',
+        available_projects: Object.keys(config.projects),
+        search_order: config.search_order
+      });
+    }
     const client = getClient(name);
     const { data, error } = await client.from('programs').select('*').limit(1);
     if (error) throw error;
-    return res.json({ status: 'healthy', supabase_connected: true, current_project: name, available_projects: Object.keys(config.projects) });
+    return res.json({ 
+      status: 'healthy', 
+      supabase_connected: true, 
+      current_project: name, 
+      available_projects: Object.keys(config.projects),
+      search_order: config.search_order
+    });
   } catch (e) {
-    return res.status(500).json({ status: 'unhealthy', supabase_connected: false, error: String(e.message || e) });
+    return res.status(500).json({ 
+      status: 'unhealthy', 
+      supabase_connected: false, 
+      error: String(e.message || e),
+      available_projects: Object.keys(config.projects),
+      search_order: config.search_order
+    });
   }
 });
 
