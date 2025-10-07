@@ -24,8 +24,8 @@ const WEB_API_BASE = 'https://btebresulthub-server.vercel.app';
 const DB_TIMEOUT = Number(process.env.DB_TIMEOUT || 5000); // overall guard if used
 const WEB_TIMEOUT = Number(process.env.WEB_TIMEOUT || 3000);
 const STUDENT_TIMEOUT = Number(process.env.STUDENT_TIMEOUT || 1200);
-const GPA_TIMEOUT = Number(process.env.GPA_TIMEOUT || 2500);
-const CGPA_TIMEOUT = Number(process.env.CGPA_TIMEOUT || 2500);
+const GPA_TIMEOUT = Number(process.env.GPA_TIMEOUT || 4000);
+const CGPA_TIMEOUT = Number(process.env.CGPA_TIMEOUT || 6000);
 
 // Create Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
