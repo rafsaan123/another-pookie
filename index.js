@@ -15,22 +15,17 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// Configuration - Two Supabase projects
-const PRIMARY_URL = process.env.SUPABASE_PRIMARY_URL || 'https://hddphaneexloretrisiy.supabase.co';
-const PRIMARY_KEY = process.env.SUPABASE_PRIMARY_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhkZHBoYW5lZXhsb3JldHJpc2l5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg2MTEzNjksImV4cCI6MjA3NDE4NzM2OX0.eMyOCUDI-iqcGY_tJUbAMw41sPnDDXfHbdMJNfcwP-w';
-
-const SECONDARY_URL = process.env.SUPABASE_SECONDARY_URL || 'https://ncjleyktzilulflbjfdg.supabase.co';
-const SECONDARY_KEY = process.env.SUPABASE_SECONDARY_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jamxleWt0emlsdWxmbGJqZmRnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg2MjI2OTUsImV4cCI6MjA3NDE5ODY5NX0.ScbXuVjULWWyCJt4IuKhUhSunkRg0H0XVVysR7756b0';
-
+// Configuration - Single Supabase with all data
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const WEB_API_BASE = 'https://btebresulthub-server.vercel.app';
 
 // Timeouts (ms)
 const DB_TIMEOUT = Number(process.env.DB_TIMEOUT || 2000);
 const WEB_TIMEOUT = Number(process.env.WEB_TIMEOUT || 3000);
 
-// Create Supabase clients
-const primaryClient = createClient(PRIMARY_URL, PRIMARY_KEY);
-const secondaryClient = createClient(SECONDARY_URL, SECONDARY_KEY);
+// Create Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Utility: timeout wrapper
 function withTimeout(promise, ms) {
@@ -40,11 +35,11 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-// Fetch student + institute from a Supabase client
-async function fetchFromSupabaseClient(client, roll, regulation, program) {
+// Fetch student + institute + GPA + CGPA from Supabase
+async function fetchFromSupabase(roll, regulation, program) {
   try {
     // Single query with JOIN
-    const { data: student, error: studentErr } = await client
+    const { data: student, error: studentErr } = await supabase
       .from('students')
       .select(`
         roll_number,
@@ -65,12 +60,12 @@ async function fetchFromSupabaseClient(client, roll, regulation, program) {
 
     // Fetch GPA and CGPA in parallel
     const [gpaRes, cgpaRes] = await Promise.allSettled([
-      client
+      supabase
         .from('gpa_records')
         .select('semester, gpa, is_reference, ref_subjects, created_at')
         .eq('roll_number', roll)
         .order('semester', { ascending: true }),
-      client
+      supabase
         .from('cgpa_records')
         .select('semester, cgpa, created_at')
         .eq('roll_number', roll)
@@ -82,62 +77,34 @@ async function fetchFromSupabaseClient(client, roll, regulation, program) {
     const cgpaRecords = cgpaRes.status === 'fulfilled' && !cgpaRes.value.error ? cgpaRes.value.data : [];
 
     return {
-      student,
-      institute: student.institutes,
-      gpaRecords,
-      cgpaRecords
+      success: true,
+      roll: student.roll_number,
+      regulation: student.regulation_year,
+      exam: student.program_name,
+      instituteData: {
+        code: student.institutes?.institute_code || student.institute_code,
+        name: student.institutes?.name || 'Unknown',
+        district: student.institutes?.district || 'Unknown'
+      },
+      resultData: gpaRecords.map(g => ({
+        publishedAt: g.created_at || '2025-01-01T00:00:00Z',
+        semester: String(g.semester || 1),
+        passed: !g.is_reference,
+        gpa: g.gpa == null ? 'ref' : String(g.gpa),
+        result: {
+          gpa: g.gpa == null ? 'ref' : String(g.gpa),
+          ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : []
+        }
+      })),
+      cgpaData: cgpaRecords.map(c => ({
+        semester: c.semester || 'Final',
+        cgpa: String(c.cgpa ?? '0.00'),
+        publishedAt: c.created_at || '2025-01-01T00:00:00Z'
+      }))
     };
   } catch (err) {
     return null;
   }
-}
-
-// Try both Supabase projects
-async function fetchFromSupabase(roll, regulation, program) {
-  // Try primary first, then secondary
-  let result = await withTimeout(
-    fetchFromSupabaseClient(primaryClient, roll, regulation, program),
-    DB_TIMEOUT
-  ).catch(() => null);
-
-  if (result) return result;
-
-  result = await withTimeout(
-    fetchFromSupabaseClient(secondaryClient, roll, regulation, program),
-    DB_TIMEOUT
-  ).catch(() => null);
-
-  return result;
-}
-
-// Format response
-function formatResponse(data) {
-  return {
-    success: true,
-    roll: data.student.roll_number,
-    regulation: data.student.regulation_year,
-    exam: data.student.program_name,
-    instituteData: {
-      code: data.institute?.institute_code || data.student.institute_code,
-      name: data.institute?.name || 'Unknown',
-      district: data.institute?.district || 'Unknown'
-    },
-    resultData: data.gpaRecords.map(g => ({
-      publishedAt: g.created_at || '2025-01-01T00:00:00Z',
-      semester: String(g.semester || 1),
-      passed: !g.is_reference,
-      gpa: g.gpa == null ? 'ref' : String(g.gpa),
-      result: {
-        gpa: g.gpa == null ? 'ref' : String(g.gpa),
-        ref_subjects: Array.isArray(g.ref_subjects) ? g.ref_subjects : []
-      }
-    })),
-    cgpaData: data.cgpaRecords.map(c => ({
-      semester: c.semester || 'Final',
-      cgpa: String(c.cgpa ?? '0.00'),
-      publishedAt: c.created_at || '2025-01-01T00:00:00Z'
-    }))
-  };
 }
 
 // Fetch from Web API fallback
@@ -185,19 +152,17 @@ async function fetchFromWebAPI(roll, regulation, program) {
 // Health check
 app.get('/health', async (req, res) => {
   try {
-    const [p1, p2] = await Promise.allSettled([
-      primaryClient.from('programs').select('*').limit(1),
-      secondaryClient.from('programs').select('*').limit(1)
-    ]);
-    
+    const { data, error } = await supabase.from('programs').select('*').limit(1);
+    if (error) throw error;
     res.json({
       status: 'healthy',
-      primary: { connected: p1.status === 'fulfilled' && !p1.value.error, url: PRIMARY_URL },
-      secondary: { connected: p2.status === 'fulfilled' && !p2.value.error, url: SECONDARY_URL }
+      supabase_connected: true,
+      supabase_url: SUPABASE_URL
     });
   } catch (e) {
     res.status(500).json({
       status: 'unhealthy',
+      supabase_connected: false,
       error: String(e.message || e)
     });
   }
@@ -213,18 +178,24 @@ app.post('/api/search-result', async (req, res) => {
     });
   }
 
-  // Try Supabase first (primary, then secondary)
-  const dbResult = await fetchFromSupabase(rollNo, regulation, program);
-  
-  if (dbResult) {
-    return res.json(formatResponse(dbResult));
+  // Try Supabase first
+  let result = await withTimeout(
+    fetchFromSupabase(rollNo, regulation, program),
+    DB_TIMEOUT
+  ).catch(() => null);
+
+  if (result) {
+    return res.json(result);
   }
 
   // Fallback to Web API
-  const webResult = await fetchFromWebAPI(rollNo, regulation, program);
+  result = await withTimeout(
+    fetchFromWebAPI(rollNo, regulation, program),
+    WEB_TIMEOUT
+  ).catch(() => null);
 
-  if (webResult) {
-    return res.json(webResult);
+  if (result) {
+    return res.json(result);
   }
 
   // Not found
@@ -240,21 +211,10 @@ app.post('/api/search-result', async (req, res) => {
 // Regulations endpoint
 app.get('/api/regulations/:program', async (req, res) => {
   try {
-    // Try primary first
-    let { data, error } = await primaryClient
+    const { data, error } = await supabase
       .from('regulations')
       .select('regulation_year')
       .eq('program_name', req.params.program);
-    
-    // If not found, try secondary
-    if (error || !data || data.length === 0) {
-      const result = await secondaryClient
-        .from('regulations')
-        .select('regulation_year')
-        .eq('program_name', req.params.program);
-      data = result.data;
-      error = result.error;
-    }
     
     if (error) throw error;
     res.json({ regulations: (data || []).map(r => r.regulation_year) });
@@ -266,6 +226,5 @@ app.get('/api/regulations/:program', async (req, res) => {
 const port = Number(process.env.PORT || 4000);
 app.listen(port, () => {
   console.log(`Node API listening on :${port}`);
-  console.log(`Primary: ${PRIMARY_URL}`);
-  console.log(`Secondary: ${SECONDARY_URL}`);
+  console.log(`Supabase: ${SUPABASE_URL}`);
 });
