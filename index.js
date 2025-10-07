@@ -21,8 +21,11 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const WEB_API_BASE = 'https://btebresulthub-server.vercel.app';
 
 // Timeouts (ms)
-const DB_TIMEOUT = Number(process.env.DB_TIMEOUT || 2000);
+const DB_TIMEOUT = Number(process.env.DB_TIMEOUT || 5000); // overall guard if used
 const WEB_TIMEOUT = Number(process.env.WEB_TIMEOUT || 3000);
+const STUDENT_TIMEOUT = Number(process.env.STUDENT_TIMEOUT || 1200);
+const GPA_TIMEOUT = Number(process.env.GPA_TIMEOUT || 2500);
+const CGPA_TIMEOUT = Number(process.env.CGPA_TIMEOUT || 2500);
 
 // Create Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -38,39 +41,48 @@ function withTimeout(promise, ms) {
 // Fetch student + institute + GPA + CGPA from Supabase
 async function fetchFromSupabase(roll, regulation, program) {
   try {
-    // Single query with JOIN
-    const { data: student, error: studentErr } = await supabase
-      .from('students')
-      .select(`
-        roll_number,
-        program_name,
-        regulation_year,
-        institute_code,
-        created_at,
-        institutes!inner(institute_code, name, district)
-      `)
-      .eq('program_name', program)
-      .eq('regulation_year', regulation)
-      .eq('roll_number', roll)
-      .eq('institutes.program_name', program)
-      .eq('institutes.regulation_year', regulation)
-      .maybeSingle();
+    // Single query with JOIN (short timeout)
+    const { data: student, error: studentErr } = await withTimeout(
+      supabase
+        .from('students')
+        .select(`
+          roll_number,
+          program_name,
+          regulation_year,
+          institute_code,
+          created_at,
+          institutes!inner(institute_code, name, district)
+        `)
+        .eq('program_name', program)
+        .eq('regulation_year', regulation)
+        .eq('roll_number', roll)
+        .eq('institutes.program_name', program)
+        .eq('institutes.regulation_year', regulation)
+        .maybeSingle(),
+      STUDENT_TIMEOUT
+    );
 
     if (studentErr || !student) return null;
 
-    // Fetch GPA and CGPA in parallel
+    // Fetch GPA and CGPA in parallel (independent timeouts)
     const [gpaRes, cgpaRes] = await Promise.allSettled([
-      supabase
-        .from('gpa_records')
-        .select('semester, gpa, is_reference, ref_subjects, created_at')
-        .eq('roll_number', roll)
-        .order('semester', { ascending: true }),
-      supabase
-        .from('cgpa_records')
-        .select('semester, cgpa, created_at')
-        .eq('roll_number', roll)
-        .order('semester', { ascending: true })
-        .limit(20)
+      withTimeout(
+        supabase
+          .from('gpa_records')
+          .select('semester, gpa, is_reference, ref_subjects, created_at')
+          .eq('roll_number', roll)
+          .order('semester', { ascending: true }),
+        GPA_TIMEOUT
+      ),
+      withTimeout(
+        supabase
+          .from('cgpa_records')
+          .select('semester, cgpa, created_at')
+          .eq('roll_number', roll)
+          .order('semester', { ascending: true })
+          .limit(20),
+        CGPA_TIMEOUT
+      )
     ]);
 
     const gpaRecords = gpaRes.status === 'fulfilled' && !gpaRes.value.error ? gpaRes.value.data : [];
